@@ -9,6 +9,7 @@ import sys
 import csv
 import io
 import json
+import ssl
 from typing import Dict, List, Optional, Any, Union
 from datetime import datetime, timedelta
 from contextlib import closing
@@ -17,6 +18,8 @@ from urllib.request import urlopen
 from fastmcp import FastMCP
 from pydantic import Field
 from google.oauth2 import service_account
+import google.auth
+import google.auth.credentials
 from googleapiclient import discovery
 from dotenv import load_dotenv
 
@@ -43,14 +46,93 @@ BID_MANAGER_API_SCOPES = ["https://www.googleapis.com/auth/doubleclickbidmanager
 
 DV360_API_NAME = "displayvideo"
 DV360_API_VERSION = "v4"
-DV360_API_SCOPES = ["https://www.googleapis.com/auth/display-video"]
+DV360_API_SCOPES = ["https://www.googleapis.com/auth/display-video.readonly"]
+
+ALLOWED_GCS_PREFIX = "https://storage.googleapis.com/"
 
 SERVICE_ACCOUNT_JSON = os.getenv("DV360_SERVICE_ACCOUNT")
 DEFAULT_PARTNER_ID = os.getenv("DV360_PARTNER_ID")
+AUTH_MODE = os.getenv("DV360_AUTH_MODE", "auto")  # "auto", "service_account", or "adc"
 
 # Global service instances
 _bid_manager_service = None
 _dv360_service = None
+
+
+def _get_credentials(scopes: List[str]) -> google.auth.credentials.Credentials:
+    """
+    Get credentials using the configured auth mode.
+
+    Supports three modes (set via DV360_AUTH_MODE env var):
+    - "service_account": Use DV360_SERVICE_ACCOUNT JSON explicitly
+    - "adc": Use Application Default Credentials (e.g. gcloud auth login)
+    - "auto" (default): Try service account first, fall back to ADC
+
+    Args:
+        scopes: OAuth scopes to request
+
+    Returns:
+        Authorized credentials
+
+    Raises:
+        ValueError: If no valid credentials can be obtained
+    """
+    mode = AUTH_MODE.lower()
+
+    if mode == "service_account":
+        return _get_service_account_credentials(scopes)
+    elif mode == "adc":
+        return _get_adc_credentials(scopes)
+    else:  # auto
+        if SERVICE_ACCOUNT_JSON:
+            return _get_service_account_credentials(scopes)
+        else:
+            logger.info("No DV360_SERVICE_ACCOUNT set, falling back to Application Default Credentials")
+            return _get_adc_credentials(scopes)
+
+
+def _get_service_account_credentials(scopes: List[str]) -> google.auth.credentials.Credentials:
+    """Get credentials from the DV360_SERVICE_ACCOUNT env var."""
+    if not SERVICE_ACCOUNT_JSON:
+        raise ValueError(
+            "DV360_SERVICE_ACCOUNT environment variable not set. "
+            "Set it to your service account JSON, or use DV360_AUTH_MODE=adc "
+            "for Application Default Credentials."
+        )
+
+    try:
+        service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError:
+        raise ValueError(
+            "Invalid JSON in DV360_SERVICE_ACCOUNT environment variable. "
+            "Ensure the entire JSON is on a single line with no surrounding quotes."
+        )
+
+    logger.info("Authenticating with service account credentials")
+    return service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=scopes
+    )
+
+
+def _get_adc_credentials(scopes: List[str]) -> google.auth.credentials.Credentials:
+    """
+    Get Application Default Credentials.
+
+    Picks up credentials from GOOGLE_APPLICATION_CREDENTIALS env var
+    (pre-generated JSON via gcloud auth application-default login)
+    or from the default gcloud auth location.
+    """
+    try:
+        credentials, project = google.auth.default(scopes=scopes)
+        logger.info(f"Authenticated with Application Default Credentials (project: {project})")
+        return credentials
+    except google.auth.exceptions.DefaultCredentialsError:
+        raise ValueError(
+            "No Application Default Credentials found. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS to your pre-generated credentials JSON, "
+            "or set DV360_SERVICE_ACCOUNT for service account auth."
+        )
 
 
 def get_bid_manager_service():
@@ -59,32 +141,11 @@ def get_bid_manager_service():
 
     Returns:
         googleapiclient.discovery.Resource: Bid Manager API service instance
-
-    Raises:
-        ValueError: If service account credentials are not configured
     """
     global _bid_manager_service
 
     if _bid_manager_service is None:
-        if not SERVICE_ACCOUNT_JSON:
-            raise ValueError(
-                "DV360_SERVICE_ACCOUNT environment variable not set. "
-                "Please set it to your service account JSON credentials."
-            )
-
-        try:
-            service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Invalid JSON in DV360_SERVICE_ACCOUNT environment variable: {e}"
-            )
-
-        logger.info("Authenticating Bid Manager API with service account credentials")
-
-        credentials = service_account.Credentials.from_service_account_info(
-            service_account_info,
-            scopes=BID_MANAGER_API_SCOPES
-        )
+        credentials = _get_credentials(BID_MANAGER_API_SCOPES)
 
         _bid_manager_service = discovery.build(
             BID_MANAGER_API_NAME,
@@ -103,32 +164,11 @@ def get_dv360_service():
 
     Returns:
         googleapiclient.discovery.Resource: DV360 API service instance
-
-    Raises:
-        ValueError: If service account credentials are not configured
     """
     global _dv360_service
 
     if _dv360_service is None:
-        if not SERVICE_ACCOUNT_JSON:
-            raise ValueError(
-                "DV360_SERVICE_ACCOUNT environment variable not set. "
-                "Please set it to your service account JSON credentials."
-            )
-
-        try:
-            service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Invalid JSON in DV360_SERVICE_ACCOUNT environment variable: {e}"
-            )
-
-        logger.info("Authenticating DV360 API with service account credentials")
-
-        credentials = service_account.Credentials.from_service_account_info(
-            service_account_info,
-            scopes=DV360_API_SCOPES
-        )
+        credentials = _get_credentials(DV360_API_SCOPES)
 
         _dv360_service = discovery.build(
             DV360_API_NAME,
@@ -156,9 +196,16 @@ def download_csv_from_gcs(gcs_path: str) -> str:
 
     Returns:
         str: CSV content as string
+
+    Raises:
+        ValueError: If the URL is not a valid Google Cloud Storage URL
     """
-    logger.info(f"Downloading report from: {gcs_path}")
-    with closing(urlopen(gcs_path)) as url:
+    if not gcs_path.startswith(ALLOWED_GCS_PREFIX):
+        raise ValueError(f"Refusing to fetch URL outside Google Cloud Storage: {gcs_path[:80]}")
+
+    logger.info(f"Downloading report from GCS")
+    ssl_context = ssl.create_default_context()
+    with closing(urlopen(gcs_path, context=ssl_context)) as url:
         content = url.read().decode('utf-8')
     logger.info(f"Report downloaded successfully ({len(content)} bytes)")
     return content
@@ -1318,6 +1365,13 @@ def dv_run_report(
         gcs_path = report_response["metadata"]["googleCloudStoragePath"]
         csv_content = download_csv_from_gcs(gcs_path)
         parsed_data = parse_csv_to_json(csv_content)
+
+        # Clean up the query object from Bid Manager to avoid accumulation
+        try:
+            service.queries().delete(queryId=query_id).execute()
+            logger.info(f"Cleaned up query {query_id}")
+        except Exception as cleanup_err:
+            logger.warning(f"Failed to clean up query {query_id}: {cleanup_err}")
 
         return {
             "success": True,
